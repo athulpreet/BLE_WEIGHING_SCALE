@@ -1,0 +1,76 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <HX711.h>
+
+
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+bool deviceConnected = false;
+const char* characteristicUUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const char* serviceUUID = "4fafc200-1fb5-459e-8fcc-c5c9c331914b";
+
+// HX711 configuration for ESP32 DevKitC
+const int LOADCELL_DOUT_PIN = 4;  // GPIO4 on ESP32 DevKitC
+const int LOADCELL_SCK_PIN = 5;   // GPIO5 on ESP32 DevKitC
+HX711 scale;
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+    }
+};
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize HX711
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.set_scale();  // This value is obtained by calibrating the scale with known weights
+  scale.tare();  // Reset the scale to 0
+  
+  // Create the BLE Device
+  BLEDevice::init("ESP32 BLE Load Sensor");
+
+  // Create the BLE Server
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+
+  // Create the BLE Service
+  BLEService *pService = pServer->createService(serviceUUID);
+
+  // Create a BLE Characteristic
+  pCharacteristic = pService->createCharacteristic(
+                     characteristicUUID,
+                     BLECharacteristic::PROPERTY_READ   |
+                     BLECharacteristic::PROPERTY_WRITE  |
+                     BLECharacteristic::PROPERTY_NOTIFY
+                   );
+
+  // Add descriptor for notification
+  pCharacteristic->addDescriptor(new BLE2902());
+
+  // Start the service
+  pService->start();
+
+  // Start advertising
+  pServer->getAdvertising()->start();
+  Serial.println("Waiting for a connection...");
+}
+
+void loop() {
+  if (deviceConnected) {
+    float weight = scale.get_units(10) / 1000.0;  // Get weight in kilograms
+    String dataToSend = "Weight: " + String(weight, 3) + " kg";  // display up to 3 decimal places
+    pCharacteristic->setValue(dataToSend.c_str());
+    pCharacteristic->notify();
+  } else {
+    delay(10);  // A minor delay to prevent excessive loop cycles when not connected.
+  }
+}
