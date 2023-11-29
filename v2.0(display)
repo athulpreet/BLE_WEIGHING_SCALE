@@ -1,0 +1,115 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <HX711.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+// OLED Display Settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// BLE Server Settings
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+bool deviceConnected = false;
+const char* characteristicUUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const char* serviceUUID = "4fafc200-1fb5-459e-8fcc-c5c9c331914b";
+
+// HX711 Settings
+const int LOADCELL_DOUT_PIN = 4; 
+const int LOADCELL_SCK_PIN = 5;  
+HX711 scale;
+
+float weight = 0;
+float weightss=0;
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+    }
+};
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize HX711
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.tare();
+
+  // Initialize OLED display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;); // Don't proceed, loop forever
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.display();
+
+  // Create BLE Device
+  BLEDevice::init("ESP32 BLE Load Sensor");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = pServer->createService(serviceUUID);
+  pCharacteristic = pService->createCharacteristic(
+                     characteristicUUID,
+                     BLECharacteristic::PROPERTY_READ   |
+                     BLECharacteristic::PROPERTY_WRITE  |
+                     BLECharacteristic::PROPERTY_NOTIFY
+                   );
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+  pServer->getAdvertising()->start();
+  Serial.println("Waiting for a connection...");
+}
+
+void loop() {
+  if (deviceConnected) {
+     long rawValue = scale.read_average(10); // Read raw value for calibration
+    Serial.print("Raw Value: ");
+    Serial.println(rawValue);
+
+weightss= (-0.01608)*rawValue-1305.38;
+Serial.print("gms: ");
+    Serial.println(weightss);
+  String dataToSend = "Weightss: " + String(weightss, 3) + " gms";  // display up to 3 decimal places
+    pCharacteristic->setValue(dataToSend.c_str());
+    pCharacteristic->notify();
+
+
+    // Update OLED Display
+   // Update OLED Display with larger, centered text and graphics
+display.clearDisplay();  // Clear the display buffer
+
+// Set text size and calculate center position
+display.setTextSize(2);  // Set text size to 2 for larger text
+int16_t x, y;
+uint16_t w, h;
+String displayText =String(weightss, 1) + " g";
+display.getTextBounds(displayText, 0, 0, &x, &y, &w, &h); // Calculate the width and height of the text
+int centerX = (SCREEN_WIDTH - w) / 2;  // Calculate center position for X
+int centerY = (SCREEN_HEIGHT - h) / 2; // Calculate center position for Y
+
+// Optional: Add some graphical elements
+display.drawRoundRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 5, SSD1306_WHITE); // Draw a rounded rectangle around the screen
+// You can add more graphics as needed
+
+// Print the centered text
+display.setCursor(centerX, centerY);
+display.println(displayText);
+display.display();  // Refresh the display with new data
+
+  } else {
+    delay(10);  // Delay to prevent excessive loop cycles when not connected.
+  }
+}
