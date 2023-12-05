@@ -1,0 +1,72 @@
+// Define button pin
+const int buttonPin = 2; // Example pin number
+
+// Variables for menu handling
+enum State { HOME, MENU, UNITS, BLE_SETTINGS, LOGGING };
+State currentState = HOME;
+unsigned long menuEntryTime = 0;
+const unsigned long menuTimeout = 5000; // 5 seconds for automatic selection
+int currentMenuOption = 0; // 0: Units, 1: BLE Settings, 2: Logging
+
+
+void setup() {
+  // ... existing setup code ...
+
+  // Initialize button pin
+  pinMode(buttonPin, INPUT_PULLUP);
+
+  // ... rest of setup code ...
+}
+
+
+
+void loop() {
+  // Handle button press
+  if (digitalRead(buttonPin) == LOW) {
+    switch (currentState) {
+      case HOME:
+        currentState = MENU;
+        menuEntryTime = millis();
+        break;
+      case MENU:
+        // Logic to handle menu navigation and selection
+        break;
+      // Add cases for UNITS, BLE_SETTINGS, LOGGING if needed
+    }
+  }
+
+  // Handle states
+  switch (currentState) {
+    case HOME:
+      // Existing home screen logic
+      break;
+    case MENU:
+      displayMenu();
+      if (millis() - menuEntryTime > menuTimeout) {
+        // Automatic selection logic
+        switch (currentMenuOption) {
+          case 0: currentState = UNITS; break;
+          case 1: currentState = BLE_SETTINGS; break;
+          case 2: currentState = LOGGING; break;
+        }
+      }
+      break;
+    // Add cases for UNITS, BLE_SETTINGS, LOGGING
+  }
+}
+
+
+
+void displayMenu() {
+  // Clear display and show menu options
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setCursor(0, 0);
+  display.println("Menu:");
+  display.println("1) Units");
+  display.println("2) BLE Settings");
+  display.println("3) Logging");
+  // Highlight the current option
+  display.drawRect(0, 10 * currentMenuOption, SCREEN_WIDTH, 10, SSD1306_WHITE);
+  display.display();
+}
