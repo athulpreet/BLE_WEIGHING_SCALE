@@ -1,0 +1,202 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <HX711.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+
+float getWeightReading();
+bool isStable(int index);
+float calculateAverage(int index);
+void displayWeight(float weight);
+void displaynormal(float weight);
+
+void displayMessage(String message);
+
+// OLED Display Settings
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// BLE Server Settings
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+bool deviceConnected = false;
+const char* characteristicUUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const char* serviceUUID = "4fafc200-1fb5-459e-8fcc-c5c9c331914b";
+
+// HX711 Settings
+const int LOADCELL_DOUT_PIN = 4; 
+const int LOADCELL_SCK_PIN = 5;  
+HX711 scale;
+
+// Readings Settings
+const int numReadings = 13; // Buffer size for 4 previous + current + 4 future readings
+float readings[numReadings]; // Array to store recent readings
+int readIndex = 0; // Index for the next reading
+const float fluctuationThreshold = 1.0; // Threshold for fluctuation range
+bool averageIsFixed = false; // Flag for indicating if average is fixed
+float fixedAverage = 0; // Variable to store fixed average
+// Global variable to store the last displayed weight
+float lastDisplayedWeight = 0;
+bool firstRun = true;
+
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) {
+      deviceConnected = true;
+    };
+
+    void onDisconnect(BLEServer* pServer) {
+      deviceConnected = false;
+    }
+};
+
+void setup() {
+  Serial.begin(115200);
+
+  // Initialize HX711
+  scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+  scale.tare();
+
+  // Initialize OLED display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;); // Don't proceed, loop forever
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0,0);
+  display.println("Ready");
+  display.display();
+
+  // Create BLE Device
+  BLEDevice::init("ESP32 BLE Load Sensor");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = pServer->createService(serviceUUID);
+  pCharacteristic = pService->createCharacteristic(
+                     characteristicUUID,
+                     BLECharacteristic::PROPERTY_READ   |
+                     BLECharacteristic::PROPERTY_WRITE  |
+                     BLECharacteristic::PROPERTY_NOTIFY
+                   );
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+  pServer->getAdvertising()->start();
+  Serial.println("Waiting for a connection...");
+
+  // Initialize readings array
+  for (int i = 0; i < numReadings; i++) {
+    readings[i] = 0.0;
+  }
+}
+
+void loop() {
+  if (deviceConnected) {
+    float currentReading = getWeightReading();
+
+    // On first run, display the current reading and set it as the last displayed weight
+    if (firstRun) {
+      displayWeight(currentReading);
+      lastDisplayedWeight = currentReading;
+      firstRun = false;
+    }
+    // On subsequent runs, check if the current reading fluctuates more than 4 units
+    else if (abs(currentReading - lastDisplayedWeight) > 4.0) {
+      displayWeight(currentReading);
+      lastDisplayedWeight = currentReading;
+    }
+
+    // BLE Data Sending (if needed)
+    // ...
+
+    // Update readIndex for the next iteration
+    readIndex = (readIndex + 1) % numReadings;
+  } else {
+    delay(10); // Slight delay when not connected
+  }
+}
+
+
+
+float getWeightReading() {
+  long rawValue = scale.read_average(10); // Read raw value for calibration
+  Serial.print("Raw Value: ");
+  Serial.println(rawValue);
+
+  float weightss = (-0.01608) * rawValue - 1305.38;
+  return weightss;
+}
+
+bool isStable(int index) {
+  for (int i = 1; i <= 4; i++) {
+    if (abs(readings[index] - readings[index - i]) > fluctuationThreshold) {
+      return false;
+    }
+  }
+  return true;
+}
+
+float calculateAverage(int index) {
+  float total = 0;
+  for (int i = -4; i <= 4; i++) {
+    total += readings[(index + i + numReadings) % numReadings];
+  }
+  return total / 9.0;
+}
+
+void displayWeight(float weight) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  int16_t x, y;
+  uint16_t w, h;
+  String displayText = String(weight, 1) + " g";
+  display.getTextBounds(displayText, 0, 0, &x, &y, &w, &h);
+  int centerX = (SCREEN_WIDTH - w) / 2;
+  int centerY = (SCREEN_HEIGHT - h) / 2;
+  display.drawRoundRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 5, SSD1306_WHITE);
+  display.setCursor(centerX, centerY);
+  display.println(displayText);
+  display.display();
+}
+
+void displaynormal(float weight) {
+  display.clearDisplay();
+  display.setTextSize(2);
+  int16_t x, y;
+  uint16_t w, h;
+  String displayText = String(weight, 1) + " g";
+  display.getTextBounds(displayText, 0, 0, &x, &y, &w, &h);
+  int centerX = (SCREEN_WIDTH - w) / 2;
+  int centerY = (SCREEN_HEIGHT - h) / 2;
+  display.setCursor(centerX, centerY);
+  display.println(displayText);
+  display.display();
+}
+
+
+
+
+
+
+void displayMessage(String message) {
+  display.clearDisplay();
+  display.setTextSize(1);
+  int16_t x, y;
+  uint16_t w, h;
+  display.getTextBounds(message, 0, 0, &x, &y, &w, &h);
+  int centerX = (SCREEN_WIDTH - w) / 2;
+  int centerY = (SCREEN_HEIGHT - h) / 2;
+  display.setCursor(centerX, centerY);
+  display.println(message);
+  display.display();
+}
+
+ 
