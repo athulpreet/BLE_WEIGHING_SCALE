@@ -1,0 +1,506 @@
+#include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <HX711.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "FS.h"
+#include "SPIFFS.h"
+#include <ESP.h>
+
+#define OLED_SDA 17
+#define OLED_SCL 18
+#define LED_PIN 21
+#define BUTTON_PIN 12
+#define MENU_BUTTON_PIN 13
+#define LOADCELL_DOUT_PIN 38
+#define LOADCELL_SCK_PIN 39
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+#define MAX_DATA_ENTRIES 10
+#define TIMEOUT_DURATION 5000
+
+
+
+volatile unsigned long lastMenuButtonDebounceTime = 0; // Initialize debounce time for the menu button
+unsigned long belowThresholdStartTime = 0; // Global variable to track when the reading goes below 0.2 kg
+
+volatile bool buttonPressed = false;
+volatile bool menuButtonPressed = false;
+volatile unsigned long lastDebounceTime = 0;
+const unsigned long debounceDelay = 50;
+
+HX711 scale;
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+BLEServer* pServer = nullptr;
+BLECharacteristic* pCharacteristic = nullptr;
+bool deviceConnected = false;
+const char* characteristicUUID = "4fafc201-1fb5-459e-8fcc-c5c9c331914b";
+const char* serviceUUID = "4fafc200-1fb5-459e-8fcc-c5c9c331914b";
+
+float savedReading = 0;
+int readIndex = 0; // Index for the next reading
+const int numReadings = 13; // Buffer size for 4 previous + current + 4 future readings
+
+bool wasDeviceConnected = false;
+float lastDisplayedWeight = 0;
+bool firstRun = true;
+bool blesend_flag = 0;
+unsigned long weightStableStartTime = millis();
+
+void IRAM_ATTR handleButtonPress() {
+    unsigned long currentTime = millis();
+    if ((currentTime - lastDebounceTime) > debounceDelay) {
+        buttonPressed = true;
+        belowThresholdStartTime = 0;
+        lastDebounceTime = currentTime;
+         
+    }
+}
+
+void IRAM_ATTR handleMenuButtonPress() {
+    unsigned long currentTime = millis();
+    if ((currentTime - lastMenuButtonDebounceTime) > debounceDelay) {
+        menuButtonPressed = true;
+        belowThresholdStartTime = 0;
+        lastMenuButtonDebounceTime = currentTime;
+        
+    }
+}
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) override {
+        deviceConnected = true;
+        wasDeviceConnected = false;
+    }
+
+    void onDisconnect(BLEServer* pServer) override {
+        deviceConnected = false;
+        wasDeviceConnected = true;
+    }
+};
+
+void setup() {
+    Serial.begin(115200);
+    Wire.begin(OLED_SDA, OLED_SCL);
+    pinMode(LED_PIN, OUTPUT);
+    pinMode(BUTTON_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(BUTTON_PIN), handleButtonPress, RISING);
+    pinMode(MENU_BUTTON_PIN, INPUT);
+    attachInterrupt(digitalPinToInterrupt(MENU_BUTTON_PIN), handleMenuButtonPress, RISING);
+
+    if (!SPIFFS.begin(true)) {
+        Serial.println("An Error has occurred while mounting SPIFFS");
+        return;
+    }
+
+    scale.begin(LOADCELL_DOUT_PIN, LOADCELL_SCK_PIN);
+    scale.tare();
+
+    if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+        Serial.println(F("SSD1306 allocation failed"));
+        for (;;);
+    }
+    displayCenteredText("THINTURE");
+    delay(3000);
+
+    BLEDevice::init("ESP32 BLE Load Sensor");
+    pServer = BLEDevice::createServer();
+    pServer->setCallbacks(new MyServerCallbacks());
+    BLEService *pService = pServer->createService(serviceUUID);
+    pCharacteristic = pService->createCharacteristic(
+                         characteristicUUID,
+                         BLECharacteristic::PROPERTY_READ |
+                         BLECharacteristic::PROPERTY_WRITE |
+                         BLECharacteristic::PROPERTY_NOTIFY
+                       );
+    pCharacteristic->addDescriptor(new BLE2902());
+    pService->start();
+    pServer->getAdvertising()->start();
+    Serial.println("Waiting for a connection...");
+
+    esp_sleep_enable_ext0_wakeup(GPIO_NUM_12, 0); // Enable deep sleep wake up on MENU_BUTTON_PIN press
+}
+
+void loop() {
+
+
+
+  
+//digitalWrite(LED_PIN, LOW);
+ if (!deviceConnected && wasDeviceConnected) {
+        Serial.println("BLE Disconnected. Restarting device.");
+        ESP.restart();
+    }
+
+
+  Serial.println("Loop start");
+  
+    Serial.println("Device connected");
+    float currentReading = getWeightReading();
+
+// Check if current reading is below 0.2 kg
+if (currentReading <= 0.2) {
+  
+    if (belowThresholdStartTime == 0) { // If this is the first time reading goes below 0.2 kg
+        belowThresholdStartTime = millis(); // Start the timer
+    } else if ((millis() - belowThresholdStartTime) > 20000) { // If it has been below 0.2 kg for more than 20 seconds
+        display.ssd1306_command(SSD1306_DISPLAYOFF); // Turn off the OLED display
+        Serial.println("Entering deep sleep mode...");
+        scale.power_down(); // Power down HX711
+        esp_deep_sleep_start(); // Enter deep sleep mode
+    }
+} else {
+    belowThresholdStartTime = 0; // Reset the timer if the reading goes above 0.2 kg
+}
+
+
+Serial.println("Current reading: " + String(currentReading));
+    // On first run, display the current reading and set it as the last displayed weight
+    if (firstRun) {
+      Serial.println("Displaying weight 1");
+     displayWeight(currentReading);
+      lastDisplayedWeight = currentReading;
+      firstRun = false;
+    }
+    // On subsequent runs, check if the current reading fluctuates more than 4 units
+    else if (abs(currentReading - lastDisplayedWeight) > 0.004) {
+
+      
+      Serial.println("Displaying weight2");
+      blesend_flag=1;
+      displayWeight(currentReading);
+      savedReading=currentReading;
+      lastDisplayedWeight = currentReading;
+    }
+
+     // Check button state independent of weight fluctuation
+  
+
+  // BLE Data Sending
+
+if (!deviceConnected) {
+
+blesend_flag=0;
+buttonPressed=0;
+    digitalWrite(LED_PIN, LOW);
+  }
+  else{
+
+
+    digitalWrite(LED_PIN, HIGH);
+  }
+
+
+        if (buttonPressed==1 &&blesend_flag==1) {
+          Serial.println("Button pressed, sending BLE data");
+            
+            String dataToSend = String(savedReading, 1) + " KG";  
+            pCharacteristic->setValue(dataToSend.c_str());
+            pCharacteristic->notify();
+            Serial.println("BLE data sent: " + dataToSend);
+            storeData(dataToSend); // Store the data in SPIFFS
+displayCenteredText("SENT");
+digitalWrite(LED_PIN, HIGH);
+delay(250);
+digitalWrite(LED_PIN, LOW);
+delay(250);
+digitalWrite(LED_PIN, HIGH);
+
+delay(250);
+digitalWrite(LED_PIN, LOW);
+
+delay(250);
+digitalWrite(LED_PIN, HIGH);
+delay(250);
+digitalWrite(LED_PIN, LOW);
+
+//while(getWeightReading()>0.02){
+
+
+
+displayWeight(savedReading);
+//}
+display.clearDisplay();
+            buttonPressed = false; // Reset the flag
+            blesend_flag=0;
+        }
+  
+
+
+
+    // Update readIndex for the next iteration
+    readIndex = (readIndex + 1) % numReadings;
+  //} 
+  /*
+  else {
+
+     Serial.println("Device not connected");
+    delay(10); // Slight delay when not connected
+
+    
+  }
+
+  */
+
+    if (menuButtonPressed) {
+      Serial.println("Displaying data menu");
+      digitalWrite(LED_PIN, LOW);
+        displayDataMenu(); // Display the menu
+        menuButtonPressed = false;
+    }
+
+     Serial.println("Loop end");
+}
+
+
+
+float getWeightReading() {
+  long rawValue = scale.read_average(10); // Read raw value for calibration
+  //Serial.print("Raw Value: ");
+  //Serial.println(rawValue);
+
+  float weightss = (-0.01608) * rawValue - 1305.38;
+
+float weightInKilograms = weightss / 1000.0;
+if(weightInKilograms<=0.2){
+  weightInKilograms=0;
+}
+
+  return weightInKilograms;
+}
+
+
+
+
+
+void displayWeight(float weight) {
+  display.clearDisplay();
+  display.setTextSize(3);
+  int16_t x, y;
+  uint16_t w, h;
+  String displayText = String(weight, 1) + " KG";
+  display.getTextBounds(displayText, 0, 0, &x, &y, &w, &h);
+  int centerX = (SCREEN_WIDTH - w) / 2;
+  int centerY = (SCREEN_HEIGHT - h) / 2;
+  //display.drawRoundRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 5, SSD1306_WHITE);
+  display.setCursor(centerX, centerY);
+  display.println(displayText);
+  display.display();
+}
+
+void displaynormal(float weight) {
+  display.clearDisplay();
+  display.setTextSize(3);
+  int16_t x, y;
+  uint16_t w, h;
+  String displayText = String(weight, 1) + " KG";
+  display.getTextBounds(displayText, 0, 0, &x, &y, &w, &h);
+  int centerX = (SCREEN_WIDTH - w) / 2;
+  int centerY = (SCREEN_HEIGHT - h) / 2;
+  display.setCursor(centerX, centerY);
+  display.println(displayText);
+  display.display();
+}
+
+
+
+
+
+
+void displayCenteredText(String message) {
+    display.clearDisplay(); // Clear the display
+
+    // Set text size and color
+    display.setTextSize(2); // Increase the text size
+    display.setTextColor(SSD1306_WHITE); // Set text color to white
+
+    // Calculate width and height of the text to center it
+    int16_t x1, y1;
+    uint16_t w, h;
+    display.getTextBounds(message, 0, 0, &x1, &y1, &w, &h); // Calculate the width and height of the text
+    int x = (SCREEN_WIDTH - w) / 2; // Calculate x position to center the text
+    int y = (SCREEN_HEIGHT - h) / 2; // Calculate y position to center the text
+
+    // Set cursor to calculated position
+    display.setCursor(x, y);
+
+    // Print the message
+    display.println(message);
+
+    // Optionally add some graphics
+    //display.drawRoundRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, 5, SSD1306_WHITE); // Draw a rounded rectangle around the screen
+    // Add more graphics here if desired
+
+    // Update the display with all of the above
+    display.display();
+}
+
+void storeData(String data) {
+    Serial.println("Storing data...");
+
+    // Initialize an array to hold up to 10 strings
+    String dataEntries[10];
+    int totalEntries = 0;
+
+    // Open the existing file to read the current data entries
+    File file = SPIFFS.open("/data.txt", FILE_READ);
+    if (file) {
+        while (file.available() && totalEntries < 10) {
+            dataEntries[totalEntries++] = file.readStringUntil('\n');
+        }
+        file.close();
+    } else {
+        Serial.println("Failed to open file for reading");
+        return;
+    }
+
+    // Shift the data to make room for the new entry at the start
+    if (totalEntries == 10) { // If the array is full, drop the last entry
+        for (int i = 9; i > 0; i--) {
+            dataEntries[i] = dataEntries[i-1];
+        }
+    } else { // If not full, shift everything right to make space at the start
+        for (int i = totalEntries; i > 0; i--) {
+            dataEntries[i] = dataEntries[i-1];
+        }
+    }
+
+    // Insert the new data at the start of the array
+    dataEntries[0] = data;
+    if (totalEntries < 10) totalEntries++; // Increment totalEntries if we're not at capacity
+
+    // Write the updated list of data entries back to the file
+    file = SPIFFS.open("/data.txt", FILE_WRITE);
+    if (file) {
+        for (int i = 0; i < totalEntries; i++) {
+            file.println(dataEntries[i]);
+        }
+        file.close();
+        Serial.println("Data stored successfully in cyclic order.");
+    } else {
+        Serial.println("Failed to open file for writing");
+    }
+}
+
+
+
+//
+//void displayDataMenu() {
+//    File file = SPIFFS.open("/data.txt", FILE_READ);
+//    if (!file) {
+//        Serial.println("Failed to open file for reading");
+//        return;
+//    }
+//
+//    String dataEntries[MAX_DATA_ENTRIES];
+//    int totalEntries = 0;
+//    while (file.available() && totalEntries < MAX_DATA_ENTRIES) {
+//        String line = file.readStringUntil('\n');
+//        float number = line.toFloat(); // Convert the string to a float
+//        number = round(number * 10) / 10.0; // Round to one decimal place
+//        dataEntries[totalEntries++] = String(number, 1); // Convert back to string with one decimal place
+//    }
+//    file.close();
+//
+//    unsigned long lastInteractionTime = millis();
+//    for (int i = 0; i < totalEntries; i++) {
+//        if (millis() - lastInteractionTime > TIMEOUT_DURATION) {
+//            Serial.println("Exiting menu due to timeout");
+//            return; // Exit the function if timeout occurred
+//        }
+//
+//        // Display the 's' symbol in the top left corner
+//        display.setTextSize(1); // Smaller text size for the symbol
+//        display.setCursor(0, 0); // Position at top left corner
+//        display.print("s"); // Print the 's' symbol
+//
+//        // Now display the weight data
+//        display.setTextSize(2); // Reset to larger text size for the weight data
+//        String displayText = dataEntries[i] + "kg"; // Prepare the weight data text
+//        displayCenteredText(displayText);
+//
+//        unsigned long startTime = millis();
+//        while (millis() - startTime < 2000) { // 2000 ms for each display
+//            if (digitalRead(MENU_BUTTON_PIN) == HIGH) {
+//                lastInteractionTime = millis(); // Reset the last interaction time if button is pressed
+//            }
+//            if (millis() - lastInteractionTime > TIMEOUT_DURATION) {
+//                Serial.println("Exiting menu due to timeout");
+//                displayCenteredText("00.0 kg");
+//                return; // Exit the function if timeout occurred
+//            }
+//        }
+//    }
+//}
+
+
+
+
+void displayDataMenu() {
+    File file = SPIFFS.open("/data.txt", FILE_READ);
+    if (!file) {
+        Serial.println("Failed to open file for reading");
+        return;
+    }
+
+    String dataEntries[MAX_DATA_ENTRIES];
+    int totalEntries = 0;
+    while (file.available() && totalEntries < MAX_DATA_ENTRIES) {
+        dataEntries[totalEntries++] = file.readStringUntil('\n');
+    }
+    file.close();
+
+    // Reverse the order in which you iterate over dataEntries
+    int currentIndex = totalEntries - 1; // Start with the last entry
+    unsigned long lastInteractionTime = millis();
+    bool exitMenu = false;
+
+    while (currentIndex >= 0 && !exitMenu) { // Iterate backwards through the array
+        unsigned long currentMillis = millis();
+
+        // Exit the menu if no interaction within TIMEOUT_DURATION
+        if (currentMillis - lastInteractionTime > TIMEOUT_DURATION) {
+            Serial.println("Exiting menu due to timeout");
+            exitMenu = true;
+            displayWeight(savedReading);
+            continue; // Skip the rest of the loop iteration
+        }
+
+        if (menuButtonPressed) {
+            display.clearDisplay();
+            display.setTextSize(1);
+            display.setCursor(0, 0);
+            // Adjusted the display to show the entry number based on the new order
+            display.print("S" + String(totalEntries - currentIndex));
+            display.setTextSize(2);
+            display.setCursor(0, 16);
+            display.print(dataEntries[currentIndex]);
+            display.display();
+
+            currentIndex--; // Move to the previous data entry
+            menuButtonPressed = false; // Reset the flag after handling
+            lastInteractionTime = millis(); // Update the last interaction time
+        }
+
+        // Add a delay to prevent looping too quickly and using too much CPU
+        delay(100);
+    }
+
+    // Clear the display and potentially prepare to show real-time weight
+    display.clearDisplay();
+}
+
+
+
+
+void toggleLED() {
+    // Function to toggle the LED as feedback
+    digitalWrite(LED_PIN, HIGH);
+    delay(250);
+    digitalWrite(LED_PIN, LOW);
+}
